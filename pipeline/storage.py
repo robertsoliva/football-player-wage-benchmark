@@ -2,6 +2,7 @@
 
 import hashlib
 import logging
+from datetime import date
 from pathlib import Path
 
 import duckdb
@@ -23,58 +24,66 @@ CREATE TABLE IF NOT EXISTS salary_data (
     league_tier        INTEGER,
     wage_eur_weekly    DOUBLE,
     ea_value_eur       DOUBLE,
-    source_hash        TEXT
+    source             TEXT,
+    run_key            TEXT
 );
 
 CREATE TABLE IF NOT EXISTS pipeline_runs (
-    source_hash  TEXT PRIMARY KEY,
-    loaded_at    TIMESTAMP DEFAULT current_timestamp,
-    row_count    INTEGER
+    run_key     TEXT PRIMARY KEY,
+    source      TEXT,
+    loaded_at   TIMESTAMP DEFAULT current_timestamp,
+    row_count   INTEGER
 );
 """
 
 
-def load(df: pd.DataFrame, source_path: Path) -> None:
+def load(df: pd.DataFrame, source_label: str) -> None:
     """
-    Insert rows from *df* into DuckDB, skipping if this exact source file
-    was already loaded (idempotency via SHA-256 of the raw file).
+    Insert rows from *df* into DuckDB.
+
+    Idempotency: keyed on (source_label + today's date) so re-running the
+    pipeline on the same day is a no-op, but a next-day run picks up fresh
+    Capology data automatically.
     """
-    source_hash = _file_hash(source_path)
+    run_key = f"{source_label}:{date.today()}"
     con = duckdb.connect(str(DB_PATH))
     con.execute(_DDL)
 
     already_loaded = con.execute(
-        "SELECT COUNT(*) FROM pipeline_runs WHERE source_hash = ?", [source_hash]
+        "SELECT COUNT(*) FROM pipeline_runs WHERE run_key = ?", [run_key]
     ).fetchone()[0]
 
     if already_loaded:
         logger.info(
-            "Source file '%s' already loaded (hash %s…). Skipping insert.",
-            source_path.name,
-            source_hash[:8],
+            "Run '%s' already loaded today. Skipping insert.",
+            run_key,
         )
         con.close()
         return
 
     df = df.copy()
-    df["source_hash"] = source_hash
+    df["run_key"] = run_key
 
-    # Ensure ea_value_eur column exists even if not in df
     if "ea_value_eur" not in df.columns:
         df["ea_value_eur"] = None
+    if "source" not in df.columns:
+        df["source"] = source_label
 
     cols = [
         "player_name", "short_name", "primary_position", "position_group",
         "age", "club_name", "league_name", "league_tier",
-        "wage_eur_weekly", "ea_value_eur", "source_hash",
+        "wage_eur_weekly", "ea_value_eur", "source", "run_key",
     ]
-    con.execute("INSERT INTO salary_data SELECT * FROM df", {"df": df[cols]})
+    staging = df[cols]
+    con.register("_staging", staging)
+    con.execute("INSERT INTO salary_data SELECT * FROM _staging")
+    con.unregister("_staging")
     con.execute(
-        "INSERT INTO pipeline_runs (source_hash, row_count) VALUES (?, ?)",
-        [source_hash, len(df)],
+        "INSERT INTO pipeline_runs (run_key, source, row_count) VALUES (?, ?, ?)",
+        [run_key, source_label, len(df)],
     )
     con.commit()
-    logger.info("Loaded %d rows into DuckDB (hash %s…).", len(df), source_hash[:8])
+    logger.info("Loaded %d rows into DuckDB (run_key=%s).", len(df), run_key)
     con.close()
 
 
@@ -83,11 +92,3 @@ def query(sql: str) -> pd.DataFrame:
     result = con.execute(sql).df()
     con.close()
     return result
-
-
-def _file_hash(path: Path) -> str:
-    sha = hashlib.sha256()
-    with open(path, "rb") as f:
-        for chunk in iter(lambda: f.read(65536), b""):
-            sha.update(chunk)
-    return sha.hexdigest()

@@ -1,4 +1,4 @@
-"""Entry point: download → clean → store."""
+"""Entry point: fetch → clean → store."""
 
 import logging
 import sys
@@ -9,18 +9,18 @@ logging.basicConfig(
     stream=sys.stdout,
 )
 
-from pipeline.ingestion import download_salary_data
-from pipeline.cleaning import load_and_clean
+from pipeline.ingestion import fetch_salary_data
+from pipeline.cleaning import clean
 from pipeline import storage
 
 
-def run(force_download: bool = False) -> None:
-    raw_path = download_salary_data(force=force_download)
-    df = load_and_clean(raw_path)
-    storage.load(df, raw_path)
-    print(f"Pipeline complete. {len(df)} rows available in wages.db.")
+def run(force: bool = False) -> None:
+    raw_df, source_label = fetch_salary_data(force=force)
+    df = clean(raw_df, source_label)
+    storage.load(df, source_label=source_label)
+    print(f"Pipeline complete. Source: {source_label}. {len(df)} rows in wages.db.")
 
 
 if __name__ == "__main__":
     force = "--force" in sys.argv
-    run(force_download=force)
+    run(force=force)

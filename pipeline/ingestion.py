@@ -1,60 +1,77 @@
-"""Download the EA FC 25 player dataset from Kaggle and save the raw CSV."""
+"""
+Orchestrates salary data acquisition:
+  1. Attempt Capology scrape (real-world estimates).
+  2. If that fails, fall back to EA FC 25 dataset via Kaggle.
+
+The caller receives a DataFrame in the canonical salary schema regardless
+of which source was used. A 'source' column records the origin.
+"""
 
 import logging
 from pathlib import Path
 
+import pandas as pd
+
 logger = logging.getLogger(__name__)
 
-KAGGLE_DATASET = "stefanoleone992/ea-sports-fc-25-complete-player-dataset"
 RAW_DIR = Path(__file__).resolve().parents[1] / "data" / "raw"
+KAGGLE_DATASET = "stefanoleone992/ea-sports-fc-25-complete-player-dataset"
 
 
 class IngestionError(Exception):
     pass
 
 
-def download_salary_data(force: bool = False) -> Path:
+def fetch_salary_data(force: bool = False) -> tuple[pd.DataFrame, str]:
     """
-    Download EA FC 25 dataset via kagglehub.
-
-    Returns the path to the main players CSV.
-    Raises IngestionError on network or auth failure.
+    Return (df, source_label) where source_label is 'capology' or 'ea_fc25'.
 
     Args:
-        force: Re-download even if the file already exists locally.
+        force: Bypass all caches and re-download from source.
     """
-    import kagglehub
+    from pipeline.scraping import scrape_all_leagues, ScrapingError
 
+    try:
+        df = scrape_all_leagues(force=force)
+        logger.info("Using Capology as salary data source.")
+        return df, "capology"
+    except ScrapingError as exc:
+        logger.warning(
+            "Capology scrape failed (%s). Falling back to EA FC 25 dataset.", exc
+        )
+
+    df = _download_ea_fc25(force=force)
+    return df, "ea_fc25"
+
+
+# ── EA FC 25 fallback ─────────────────────────────────────────────────────────
+
+def _download_ea_fc25(force: bool = False) -> pd.DataFrame:
+    target = RAW_DIR / "ea_fc25_players.csv"
     RAW_DIR.mkdir(parents=True, exist_ok=True)
 
-    target = RAW_DIR / "ea_fc25_players.csv"
     if target.exists() and not force:
-        logger.info("Raw file already present at %s, skipping download.", target)
-        return target
+        logger.info("EA FC 25 raw file already present, skipping download.")
+        return pd.read_csv(target, low_memory=False)
 
-    logger.info("Downloading dataset '%s' from Kaggle…", KAGGLE_DATASET)
+    logger.info("Downloading EA FC 25 dataset from Kaggle…")
     try:
-        dataset_path = kagglehub.dataset_download(KAGGLE_DATASET)
+        import kagglehub
+        dataset_path = Path(kagglehub.dataset_download(KAGGLE_DATASET))
     except Exception as exc:
         raise IngestionError(
-            f"Failed to download dataset '{KAGGLE_DATASET}': {exc}"
+            f"EA FC 25 fallback also failed — cannot download from Kaggle: {exc}. "
+            "Ensure ~/.kaggle/kaggle.json exists or set KAGGLE_USERNAME + KAGGLE_KEY."
         ) from exc
 
-    dataset_path = Path(dataset_path)
-    # kagglehub places files inside a versioned subdirectory; find the main CSV
     candidates = sorted(dataset_path.rglob("male_players*.csv"))
     if not candidates:
         candidates = sorted(dataset_path.rglob("*.csv"))
     if not candidates:
-        raise IngestionError(
-            f"No CSV found in downloaded dataset at {dataset_path}"
-        )
+        raise IngestionError(f"No CSV found in downloaded Kaggle dataset at {dataset_path}")
 
-    # Use the largest file as the main player dataset
     source = max(candidates, key=lambda p: p.stat().st_size)
-    logger.info("Using source file: %s", source)
-
     import shutil
     shutil.copy(source, target)
-    logger.info("Saved raw data to %s", target)
-    return target
+    logger.info("EA FC 25 raw data saved to %s", target)
+    return pd.read_csv(target, low_memory=False)
