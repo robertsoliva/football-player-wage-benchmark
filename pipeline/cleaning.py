@@ -16,7 +16,9 @@ import pandas as pd
 logger = logging.getLogger(__name__)
 
 POSITION_MAP = {
-    "GK": "GK",
+    # Canonical passthrough (scraper already resolved these)
+    "ATT": "ATT", "DEF": "DEF", "MID": "MID", "GK": "GK",
+    # EA FC 25 specific positions
     "CB": "DEF", "LB": "DEF", "RB": "DEF", "LWB": "DEF", "RWB": "DEF",
     "CDM": "MID", "CM": "MID", "CAM": "MID", "LM": "MID", "RM": "MID",
     "LW": "ATT", "RW": "ATT", "ST": "ATT", "CF": "ATT", "RF": "ATT",
@@ -89,6 +91,12 @@ def _clean_capology(df: pd.DataFrame) -> pd.DataFrame:
 
     df["position_group"] = df["position_group"].apply(
         lambda p: POSITION_MAP.get(str(p).strip(), "MID")
+    )
+    # Use primary_position as authoritative fallback (covers GK and edge cases
+    # where Capology's broad position code didn't map cleanly)
+    df["position_group"] = df.apply(
+        lambda row: POSITION_MAP.get(str(row["primary_position"]).strip(), row["position_group"]),
+        axis=1,
     )
 
     if "ea_value_eur" not in df.columns:
