@@ -119,19 +119,55 @@ pytest tests/ -v
 
 ### How peer groups are built
 
-For a given player, peers are drawn from the salary database using a **weighted KNN** on three normalised features:
+For a given player, peers are drawn from the salary database using a **weighted KNN** on four normalised features:
 
-| Feature | Weight | Rationale |
-|---------|--------|-----------|
-| Market value | **0.40** | Strongest single predictor of wage level |
-| League tier | **0.35** | Wages differ substantially across league tiers |
-| Age | **0.25** | Controls for career-stage effects |
+| Feature | Weight | Encoding | Rationale |
+|---------|--------|----------|-----------|
+| Market value | **0.30** | log-scaled then MinMax | Captures ability level; log-scale compresses the €10 k – €200 M range |
+| League | **0.30** | per-league median wage, normalised | Premier League wages are ~3× Ligue 1 — treating them as identical "Tier 1" discards real signal |
+| Age | **0.30** | MinMax | Career-stage proxy; more experienced players command a premium |
+| Position | **0.10** | per-position median wage, normalised | Soft penalty for cross-position mixing (ATT vs. DEF) |
 
-Position group is a **hard filter** applied before KNN — attackers are only compared to other attackers, etc. League tiers: Premier League / La Liga / Bundesliga / Ligue 1 / Serie A = Tier 1; everything else = Tier 2.
+**Goalkeepers are hard-filtered** — their labour market is structurally different and comparing GKs to field players would distort results. For field players (DEF / MID / ATT), position is a soft KNN feature rather than a hard filter, so a deep-lying midfielder and a centre-back can appear in each other's peer set with an appropriate distance penalty.
 
-Market values are log-scaled before normalisation to compress the heavy right tail (€10 k youth players vs. €200 M superstars). All three features are then scaled to [0, 1] using MinMaxScaler fitted on the peer pool.
+All features are scaled to [0, 1] using MinMaxScaler fitted on the peer pool. KNN uses L2 distance on the weighted feature matrix; up to 20 nearest neighbours are selected.
 
-KNN uses L2 distance on the weighted feature matrix; up to 20 nearest neighbours are selected.
+### Weight validation
+
+Weights are tuned empirically, not set by hand. The approach:
+
+1. **Holdout split** — 20 % of Capology players (stratified by position group, seed 42) held out as a test set; the remaining 80 % form the salary pool.
+2. **Grid search** — all weight 4-tuples `(w_market_value, w_league, w_age, w_position)` that sum to 1.0 in steps of 0.1 (84 combinations) are evaluated.
+3. **Metrics** per combination:
+   - *Coverage*: % of holdout players whose actual wage falls inside the predicted [P25, P75].
+   - *Band width*: average (P75 − P25) as a share of median peer wage.
+4. **Selection** — highest coverage, tie-break by narrowest band.
+
+Results on 474 holdout players:
+
+| Model | Weights (mv / league / age / pos) | Coverage | Band width |
+|-------|-----------------------------------|----------|------------|
+| Original manual | 0.40 / 0.35 / 0.25 / — | 48.7 % | 76.4 % |
+| 3-feature tuned | 0.30 / — / 0.50 / — | 51.9 % | 78.7 % |
+| **4-feature tuned** | **0.30 / 0.30 / 0.30 / 0.10** | **54.0 %** | **83.8 %** |
+
+The main gain comes from replacing the binary tier flag with a continuous league-wage encoding. Premier League median annual wages (€2.7 M) are roughly 3× Ligue 1 (€0.9 M) — once the model can see that difference, it stops grouping those players as peers.
+
+The full grid and validation script are in `scripts/tune_weights.py`.
+
+### Why KNN over XGBoost?
+
+XGBoost with quantile regression (predicting P25 / P50 / P75 directly) was tested on the same holdout using the same features — league one-hot (4 columns), position one-hot, log market value, age:
+
+| Model | Coverage | Median band width |
+|-------|----------|-------------------|
+| KNN (tuned, 4 features) | 54.0 % | 76.6 % |
+| XGBoost quantile | 44.7 % | 63.3 % |
+
+XGBoost produces tighter intervals but misses the actual wage more often — a worse trade-off for this use case. Two reasons:
+
+1. **Label noise**: two players with near-identical features can earn 2–3× different wages due to individual negotiation, club resources, and star power that no public feature captures. KNN handles this naturally by surfacing the actual distribution of peer wages; a regression model tries to fit a smooth function and gets penalised by residual noise it cannot explain.
+2. **Dataset size**: 2 372 records is relatively small for XGBoost to learn complex interaction effects. With broader coverage — lower leagues, historical seasons, or salary data from other regions — XGBoost would likely close the gap and eventually surpass KNN, since it can learn non-linear interactions that the distance metric cannot.
 
 ### Output
 

@@ -4,11 +4,13 @@ find similar peers in the salary database and return an expected
 salary range with a confidence rating.
 
 KNN features (all normalised to [0, 1] before weighting):
-  - market_value   (weight 0.40) — from SoccerSolver; enriched via fuzzy match
-  - league_tier    (weight 0.35) — top-5 league = 1, others = 2
-  - age            (weight 0.25) — career-stage proxy
+  - market_value  — log-scaled to compress the heavy right tail
+  - league        — encoded as the per-league median wage, so PL ≠ Ligue 1
+  - age           — career-stage proxy
+  - position      — encoded as per-position median wage (GKs hard-filtered separately)
 
-Peers are filtered to the same position group before KNN.
+Weights are empirically tuned via 80/20 holdout validation on 2 372 Capology players
+(see scripts/tune_weights.py).
 """
 
 from __future__ import annotations
@@ -29,18 +31,24 @@ logger = logging.getLogger(__name__)
 DB_PATH = Path(__file__).resolve().parents[1] / "wages.db"
 SS_DATA = Path(__file__).resolve().parents[1] / "data" / "soccersolver" / "data.csv"
 
-LEAGUE_TIER = {
-    "GB1": 1, "ES1": 1, "L1": 1, "IT1": 1, "FR1": 1,
+# Maps SoccerSolver competition_id → Capology league_name
+SS_COMP_TO_LEAGUE = {
+    "GB1": "English Premier League",
+    "ES1": "Spain Primera Division",
+    "L1":  "German 1. Bundesliga",
+    "IT1": "Italian Serie A",
+    "FR1": "French Ligue 1",
 }
 
+# Weights tuned via 80/20 holdout validation on 2 372 Capology players
+# (see scripts/tune_weights.py). Best coverage: 54.0% at (0.30/0.30/0.30/0.10).
 WEIGHTS = {
-    "market_value": 0.40,
-    "league_tier":  0.35,
-    "age":          0.25,
+    "market_value": 0.30,
+    "league":       0.30,
+    "age":          0.30,
+    "position":     0.10,
 }
 
-HIGH_PEERS = 15
-LOW_PEERS = 5
 FUZZY_THRESHOLD = 80   # minimum name-match score (0–100) to accept enrichment
 
 
@@ -51,7 +59,7 @@ class BenchmarkResult:
     median_wage_eur_year: float
     p25_wage_eur_year: float
     p75_wage_eur_year: float
-    confidence: str           # "High" | "Medium" | "Low" | "Insufficient data"
+    range_pct: float          # (P75 - P25) / median × 100 — smaller = tighter prediction
     peer_count: int
     peers: pd.DataFrame = field(repr=False)
     current_wage_percentile: float | None = None
@@ -71,8 +79,8 @@ def _load_ss_data() -> pd.DataFrame:
     df["birth_date"] = pd.to_datetime(df["birth_date"], utc=True, errors="coerce")
     age_days = (pd.Timestamp.now(tz="UTC") - df["birth_date"]).dt.days
     df["age"] = (age_days / 365.25).fillna(25).astype(int)
-    df["league_tier"] = df["competition_id"].map(LEAGUE_TIER).fillna(2).astype(int)
     df["market_value"] = pd.to_numeric(df["market_value"], errors="coerce").fillna(0)
+    df["league_name"] = df["competition_id"].map(SS_COMP_TO_LEAGUE)  # None for non-top-5
     return df
 
 
@@ -177,39 +185,60 @@ def benchmark_player(
 
     salary_df = load_enriched_salary_db()
 
-    # Filter to the same position group
-    peers_pool = salary_df[salary_df["position_group"] == position_group].copy()
+    # GKs are a structurally different labour market; hard-filter them.
+    # For field players, position is a soft KNN feature so DEF/MID/ATT can
+    # mix with an appropriate distance penalty.
+    if position_group == "GK":
+        peers_pool = salary_df[salary_df["position_group"] == "GK"].copy()
+    else:
+        peers_pool = salary_df[salary_df["position_group"] != "GK"].copy()
 
     if peers_pool.empty:
         return _no_data_result(player_name, position_group)
 
-    # --- Build feature matrix ---
-    # Market value: log-scale then normalise (handles heavy right skew)
+    # --- Build feature matrix (4 features) ---
+
+    # 1. Market value — log-scale then MinMax
     scaler_mv = MinMaxScaler()
     peer_mv = np.log1p(peers_pool["market_value_eur"].fillna(0).values).reshape(-1, 1)
-    peers_pool = peers_pool.copy()
     peers_pool["_mv_norm"] = scaler_mv.fit_transform(peer_mv).ravel()
-
-    player_mv_norm = scaler_mv.transform(
+    player_mv_norm = float(scaler_mv.transform(
         np.log1p([[player["market_value"]]]).reshape(-1, 1)
-    )[0][0]
+    )[0][0])
 
-    # League tier: already 1 or 2, normalise to [0, 1]
-    scaler_tier = MinMaxScaler()
-    peer_tier = peers_pool["league_tier"].values.reshape(-1, 1)
-    peers_pool["_tier_norm"] = scaler_tier.fit_transform(peer_tier).ravel()
-    player_tier_norm = scaler_tier.transform([[player["league_tier"]]])[0][0]
+    # 2. League — encode as per-league median wage so PL ≠ Ligue 1
+    league_medians = peers_pool.groupby("league_name")["wage_eur_weekly"].median()
+    peer_league_raw = peers_pool["league_name"].map(league_medians).fillna(
+        league_medians.mean()
+    ).values.reshape(-1, 1)
+    scaler_league = MinMaxScaler()
+    peers_pool["_league_norm"] = scaler_league.fit_transform(peer_league_raw).ravel()
+    player_league_name = player.get("league_name")
+    player_league_raw = float(league_medians.get(player_league_name, league_medians.mean()))
+    player_league_raw = float(np.clip(player_league_raw, peer_league_raw.min(), peer_league_raw.max()))
+    player_league_norm = float(scaler_league.transform([[player_league_raw]])[0][0])
 
-    # Age: normalise across peer pool
+    # 3. Age — MinMax
     scaler_age = MinMaxScaler()
     peer_age = peers_pool["age"].fillna(25).values.reshape(-1, 1)
     peers_pool["_age_norm"] = scaler_age.fit_transform(peer_age).ravel()
-    player_age_norm = scaler_age.transform([[player["age"]]])[0][0]
+    player_age_norm = float(scaler_age.transform([[player["age"]]])[0][0])
+
+    # 4. Position — encode as per-position median wage
+    pos_medians = peers_pool.groupby("position_group")["wage_eur_weekly"].median()
+    peer_pos_raw = peers_pool["position_group"].map(pos_medians).fillna(
+        pos_medians.mean()
+    ).values.reshape(-1, 1)
+    scaler_pos = MinMaxScaler()
+    peers_pool["_pos_norm"] = scaler_pos.fit_transform(peer_pos_raw).ravel()
+    player_pos_raw = float(pos_medians.get(position_group, pos_medians.mean()))
+    player_pos_raw = float(np.clip(player_pos_raw, peer_pos_raw.min(), peer_pos_raw.max()))
+    player_pos_norm = float(scaler_pos.transform([[player_pos_raw]])[0][0])
 
     # Apply weights
-    w = np.array([WEIGHTS["market_value"], WEIGHTS["league_tier"], WEIGHTS["age"]])
-    X = peers_pool[["_mv_norm", "_tier_norm", "_age_norm"]].values * w
-    player_vec = np.array([[player_mv_norm, player_tier_norm, player_age_norm]]) * w
+    w = np.array([WEIGHTS["market_value"], WEIGHTS["league"], WEIGHTS["age"], WEIGHTS["position"]])
+    X = peers_pool[["_mv_norm", "_league_norm", "_age_norm", "_pos_norm"]].values * w
+    player_vec = np.array([[player_mv_norm, player_league_norm, player_age_norm, player_pos_norm]]) * w
 
     n_neighbors = min(20, len(X))
     knn = NearestNeighbors(n_neighbors=n_neighbors, metric="euclidean")
@@ -220,11 +249,10 @@ def benchmark_player(
     wages_year = peers["wage_eur_weekly"] * 52
 
     peer_count = len(peers)
-    confidence = (
-        "High" if peer_count >= HIGH_PEERS
-        else "Medium" if peer_count >= LOW_PEERS
-        else "Low"
-    )
+    median_w = float(np.median(wages_year))
+    p25_w    = float(np.percentile(wages_year, 25))
+    p75_w    = float(np.percentile(wages_year, 75))
+    range_pct = (p75_w - p25_w) / median_w * 100 if median_w > 0 else 0.0
 
     percentile = None
     if current_wage_eur_year is not None:
@@ -233,10 +261,10 @@ def benchmark_player(
     return BenchmarkResult(
         player_name=player_name,
         position_group=position_group,
-        median_wage_eur_year=float(np.median(wages_year)),
-        p25_wage_eur_year=float(np.percentile(wages_year, 25)),
-        p75_wage_eur_year=float(np.percentile(wages_year, 75)),
-        confidence=confidence,
+        median_wage_eur_year=median_w,
+        p25_wage_eur_year=p25_w,
+        p75_wage_eur_year=p75_w,
+        range_pct=round(range_pct, 1),
         peer_count=peer_count,
         peers=peers[["player_name", "club_name", "league_name", "age",
                       "wage_eur_weekly", "market_value_eur"]].copy(),
@@ -251,7 +279,7 @@ def _no_data_result(player_name: str, position_group: str) -> BenchmarkResult:
         median_wage_eur_year=0,
         p25_wage_eur_year=0,
         p75_wage_eur_year=0,
-        confidence="Insufficient data",
+        range_pct=0.0,
         peer_count=0,
         peers=pd.DataFrame(),
     )

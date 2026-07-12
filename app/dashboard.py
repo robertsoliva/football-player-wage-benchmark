@@ -73,18 +73,16 @@ with st.spinner("Computing peer group…"):
         st.error(str(exc))
         st.stop()
 
-# ── Confidence badge ──────────────────────────────────────────────────────────
-badge_color = {"High": "green", "Medium": "orange", "Low": "red"}.get(
-    result.confidence, "grey"
-)
-st.markdown(
-    f"**Confidence:** :{badge_color}[{result.confidence}]  "
-    f"({result.peer_count} comparable peers found)"
-)
-
-if result.confidence == "Insufficient data":
+# ── Precision indicator ───────────────────────────────────────────────────────
+if result.peer_count == 0:
     st.warning("Not enough peers to compute a reliable benchmark for this player.")
     st.stop()
+
+half_pct = result.range_pct / 2
+st.markdown(
+    f"**{result.peer_count} comparable peers found** · "
+    f"range spans ±{half_pct:.0f}% of the median peer wage"
+)
 
 # ── Salary range ──────────────────────────────────────────────────────────────
 st.subheader("Expected salary range")
