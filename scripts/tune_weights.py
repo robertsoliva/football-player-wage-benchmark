@@ -1,13 +1,14 @@
 """
 Weight tuning for the KNN benchmark.
 
-4 features: market_value, league (per-league median wage), age, position (per-position median wage).
+5 features: market_value, league (per-league median wage), age,
+            position (per-position median wage), club (per-club median wage).
 GKs are hard-filtered and evaluated against the GK pool only.
-Field players (DEF/MID/ATT) share a pool; position is a soft KNN feature.
+Field players (DEF/MID/ATT) share a pool; position and club are soft KNN features.
 
 Uses Capology salary records (real wages) as ground truth:
   - 80 / 20 stratified split by position group (seed 42)
-  - Grid search over all weight 4-tuples that sum to 1.0 in steps of 0.1
+  - Grid search over all weight 5-tuples that sum to 1.0 in steps of 0.1 (~126 combos)
   - Metrics: coverage (% whose actual wage falls in [P25, P75]) and band width
   - Selection: highest coverage, tie-break by narrowest band
 """
@@ -32,7 +33,7 @@ STEP = 0.1
 def load_data() -> pd.DataFrame:
     con = duckdb.connect(str(DB_PATH), read_only=True)
     df = con.execute(
-        "SELECT player_name, position_group, league_name, age, "
+        "SELECT player_name, position_group, league_name, club_name, age, "
         "       wage_eur_weekly, market_value_eur "
         "FROM salary_data "
         "WHERE market_value_eur > 0 AND wage_eur_weekly > 0"
@@ -53,7 +54,7 @@ def split(df: pd.DataFrame, test_frac: float = 0.20) -> tuple[pd.DataFrame, pd.D
 
 
 def predict(player: pd.Series, train: pd.DataFrame, w: tuple) -> dict | None:
-    w_mv, w_league, w_age, w_pos = w
+    w_mv, w_league, w_age, w_pos, w_club = w
 
     if player["position_group"] == "GK":
         pool = train[train["position_group"] == "GK"].copy()
@@ -69,32 +70,38 @@ def predict(player: pd.Series, train: pd.DataFrame, w: tuple) -> dict | None:
     pool["_mv"] = scaler_mv.fit_transform(mv_log).ravel()
     p_mv = float(scaler_mv.transform(np.log1p([[player["market_value_eur"]]]).reshape(-1, 1))[0][0])
 
-    # 2. League (per-league median wage)
-    league_medians = pool.groupby("league_name")["wage_eur_weekly"].median()
-    peer_league_raw = pool["league_name"].map(league_medians).fillna(league_medians.mean()).values.reshape(-1, 1)
-    scaler_league = MinMaxScaler()
-    pool["_league"] = scaler_league.fit_transform(peer_league_raw).ravel()
-    player_league_raw = float(league_medians.get(player["league_name"], league_medians.mean()))
-    player_league_raw = float(np.clip(player_league_raw, peer_league_raw.min(), peer_league_raw.max()))
-    p_league = float(scaler_league.transform([[player_league_raw]])[0][0])
+    # 2. League
+    league_med = pool.groupby("league_name")["wage_eur_weekly"].median()
+    peer_lg_raw = pool["league_name"].map(league_med).fillna(league_med.mean()).values.reshape(-1, 1)
+    scaler_lg = MinMaxScaler()
+    pool["_league"] = scaler_lg.fit_transform(peer_lg_raw).ravel()
+    plr_lg = float(np.clip(league_med.get(player["league_name"], league_med.mean()), peer_lg_raw.min(), peer_lg_raw.max()))
+    p_league = float(scaler_lg.transform([[plr_lg]])[0][0])
 
     # 3. Age
     scaler_age = MinMaxScaler()
     pool["_age"] = scaler_age.fit_transform(pool[["age"]].fillna(25)).ravel()
     p_age = float(scaler_age.transform([[player["age"]]])[0][0])
 
-    # 4. Position (per-position median wage)
-    pos_medians = pool.groupby("position_group")["wage_eur_weekly"].median()
-    peer_pos_raw = pool["position_group"].map(pos_medians).fillna(pos_medians.mean()).values.reshape(-1, 1)
+    # 4. Position
+    pos_med = pool.groupby("position_group")["wage_eur_weekly"].median()
+    peer_pos_raw = pool["position_group"].map(pos_med).fillna(pos_med.mean()).values.reshape(-1, 1)
     scaler_pos = MinMaxScaler()
     pool["_pos"] = scaler_pos.fit_transform(peer_pos_raw).ravel()
-    player_pos_raw = float(pos_medians.get(player["position_group"], pos_medians.mean()))
-    player_pos_raw = float(np.clip(player_pos_raw, peer_pos_raw.min(), peer_pos_raw.max()))
-    p_pos = float(scaler_pos.transform([[player_pos_raw]])[0][0])
+    plr_pos = float(np.clip(pos_med.get(player["position_group"], pos_med.mean()), peer_pos_raw.min(), peer_pos_raw.max()))
+    p_pos = float(scaler_pos.transform([[plr_pos]])[0][0])
 
-    weights = np.array([w_mv, w_league, w_age, w_pos])
-    X = pool[["_mv", "_league", "_age", "_pos"]].values * weights
-    x_player = np.array([[p_mv, p_league, p_age, p_pos]]) * weights
+    # 5. Club — holdout player's club_name is already from Capology, no name-mapping needed
+    club_med = pool.groupby("club_name")["wage_eur_weekly"].median()
+    peer_club_raw = pool["club_name"].map(club_med).fillna(club_med.mean()).values.reshape(-1, 1)
+    scaler_club = MinMaxScaler()
+    pool["_club"] = scaler_club.fit_transform(peer_club_raw).ravel()
+    plr_club = float(np.clip(club_med.get(player["club_name"], league_med.get(player["league_name"], club_med.mean())), peer_club_raw.min(), peer_club_raw.max()))
+    p_club = float(scaler_club.transform([[plr_club]])[0][0])
+
+    weights = np.array([w_mv, w_league, w_age, w_pos, w_club])
+    X = pool[["_mv", "_league", "_age", "_pos", "_club"]].values * weights
+    x_player = np.array([[p_mv, p_league, p_age, p_pos, p_club]]) * weights
 
     k = min(N_NEIGHBOURS, len(X))
     knn = NearestNeighbors(n_neighbors=k, metric="euclidean")
@@ -118,9 +125,10 @@ def weight_grid(step: float = STEP) -> list[tuple]:
     for w1 in vals:
         for w2 in vals:
             for w3 in vals:
-                w4 = round(1.0 - w1 - w2 - w3, 2)
-                if step * 0.5 <= w4 <= 1.0 - step * 0.5:
-                    combos.append((w1, w2, w3, w4))
+                for w4 in vals:
+                    w5 = round(1.0 - w1 - w2 - w3 - w4, 2)
+                    if step * 0.5 <= w5 <= 1.0 - step * 0.5:
+                        combos.append((w1, w2, w3, w4, w5))
     return combos
 
 
@@ -138,6 +146,7 @@ def evaluate(train: pd.DataFrame, test: pd.DataFrame, combos: list[tuple]) -> pd
             "w_league":       w[1],
             "w_age":          w[2],
             "w_position":     w[3],
+            "w_club":         w[4],
             "coverage":       round(np.mean(hits), 4) if hits else 0.0,
             "avg_width_pct":  round(float(np.nanmean(widths)), 4) if widths else np.nan,
             "n_evaluated":    len(hits),
@@ -153,14 +162,13 @@ def evaluate(train: pd.DataFrame, test: pd.DataFrame, combos: list[tuple]) -> pd
 if __name__ == "__main__":
     print("Loading data…")
     df = load_data()
-    print(f"  {len(df)} players  |  leagues: {sorted(df['league_name'].unique())}")
-    print(f"  positions: {df['position_group'].value_counts().to_dict()}\n")
+    print(f"  {len(df)} players  |  {df['club_name'].nunique()} clubs  |  {df['league_name'].nunique()} leagues\n")
 
     train, test = split(df)
     print(f"Train: {len(train)}  |  Test: {len(test)}\n")
 
     combos = weight_grid()
-    print(f"Testing {len(combos)} weight combinations (market_value / league / age / position)…\n")
+    print(f"Testing {len(combos)} weight combinations (mv / league / age / pos / club)…\n")
     results = evaluate(train, test, combos)
 
     print("── Top 20 combinations ─────────────────────────────────────────────────")
@@ -172,6 +180,7 @@ if __name__ == "__main__":
     print(f"  league       = {best['w_league']}")
     print(f"  age          = {best['w_age']}")
     print(f"  position     = {best['w_position']}")
+    print(f"  club         = {best['w_club']}")
     print(f"  coverage     = {best['coverage']:.1%}")
     print(f"  avg width    = {best['avg_width_pct']:.1%} of median peer wage")
 

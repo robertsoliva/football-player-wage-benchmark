@@ -40,16 +40,33 @@ SS_COMP_TO_LEAGUE = {
     "FR1": "French Ligue 1",
 }
 
-# Weights tuned via 80/20 holdout validation on 2 372 Capology players
-# (see scripts/tune_weights.py). Best coverage: 54.0% at (0.30/0.30/0.30/0.10).
-WEIGHTS = {
-    "market_value": 0.30,
-    "league":       0.30,
-    "age":          0.30,
-    "position":     0.10,
+# Curated overrides where partial-ratio fuzzy matching fails (abbreviations, diacritics)
+SS_TEAM_TO_CAPOLOGY_CLUB = {
+    "Paris Saint-Germain":       "PSG",
+    "1.FC Köln":                 "Koln",
+    "Athletic Bilbao":           "Athletic Club",
+    "Atlético de Madrid":        "Atletico Madrid",
+    "Bayer 04 Leverkusen":       "Bayer Leverkusen",
+    "Celta de Vigo":             "Celta Vigo",
+    "Real Betis Balompié":       "Real Betis",
+    "Stade Rennais FC":          "Rennes",
+    "Deportivo Alavés":          "Alaves",
+    "RCD Espanyol Barcelona":    "Espanyol",
+    "Borussia Mönchengladbach":  "Monchengladbach",
 }
 
-FUZZY_THRESHOLD = 80   # minimum name-match score (0–100) to accept enrichment
+# Weights tuned via 80/20 holdout validation on 2 372 Capology players
+# (see scripts/tune_weights.py). Best coverage+width combo: (0.20/0.10/0.40/0.10/0.20).
+WEIGHTS = {
+    "market_value": 0.20,
+    "league":       0.10,
+    "age":          0.40,
+    "position":     0.10,
+    "club":         0.20,
+}
+
+FUZZY_THRESHOLD = 80          # minimum score (0–100) to accept player-name enrichment
+CLUB_MATCH_THRESHOLD = 85     # minimum partial_ratio score to accept club-name lookup
 
 
 @dataclass
@@ -72,6 +89,19 @@ def _load_salary_db() -> pd.DataFrame:
     df = con.execute("SELECT * FROM salary_data").df()
     con.close()
     return df
+
+
+def _resolve_club(team_name: str, capology_clubs: list[str]) -> str | None:
+    """Map a SoccerSolver team_name to a Capology club_name using curated overrides
+    then partial-ratio fuzzy matching. Returns None if no confident match found."""
+    candidate = SS_TEAM_TO_CAPOLOGY_CLUB.get(team_name, team_name)
+    result = fuzz_process.extractOne(
+        candidate, capology_clubs,
+        scorer=fuzz.partial_ratio,
+    )
+    if result and result[1] >= CLUB_MATCH_THRESHOLD:
+        return result[0]
+    return None
 
 
 def _load_ss_data() -> pd.DataFrame:
@@ -196,7 +226,7 @@ def benchmark_player(
     if peers_pool.empty:
         return _no_data_result(player_name, position_group)
 
-    # --- Build feature matrix (4 features) ---
+    # --- Build feature matrix (5 features) ---
 
     # 1. Market value — log-scale then MinMax
     scaler_mv = MinMaxScaler()
@@ -235,10 +265,27 @@ def benchmark_player(
     player_pos_raw = float(np.clip(player_pos_raw, peer_pos_raw.min(), peer_pos_raw.max()))
     player_pos_norm = float(scaler_pos.transform([[player_pos_raw]])[0][0])
 
+    # 5. Club — encode as per-club median wage (captures PSG vs Strasbourg etc.)
+    cap_clubs = peers_pool["club_name"].unique().tolist()
+    club_medians = peers_pool.groupby("club_name")["wage_eur_weekly"].median()
+    peer_club_raw = peers_pool["club_name"].map(club_medians).values.reshape(-1, 1)
+    scaler_club = MinMaxScaler()
+    peers_pool["_club_norm"] = scaler_club.fit_transform(peer_club_raw).ravel()
+    player_team = player.get("team_name", "")
+    matched_club = _resolve_club(str(player_team), cap_clubs)
+    if matched_club:
+        player_club_raw = float(club_medians.get(matched_club, league_medians.get(player_league_name, league_medians.mean())))
+    else:
+        player_club_raw = float(league_medians.get(player_league_name, league_medians.mean()))
+    player_club_raw = float(np.clip(player_club_raw, peer_club_raw.min(), peer_club_raw.max()))
+    player_club_norm = float(scaler_club.transform([[player_club_raw]])[0][0])
+
     # Apply weights
-    w = np.array([WEIGHTS["market_value"], WEIGHTS["league"], WEIGHTS["age"], WEIGHTS["position"]])
-    X = peers_pool[["_mv_norm", "_league_norm", "_age_norm", "_pos_norm"]].values * w
-    player_vec = np.array([[player_mv_norm, player_league_norm, player_age_norm, player_pos_norm]]) * w
+    w = np.array([WEIGHTS["market_value"], WEIGHTS["league"], WEIGHTS["age"],
+                  WEIGHTS["position"], WEIGHTS["club"]])
+    X = peers_pool[["_mv_norm", "_league_norm", "_age_norm", "_pos_norm", "_club_norm"]].values * w
+    player_vec = np.array([[player_mv_norm, player_league_norm, player_age_norm,
+                            player_pos_norm, player_club_norm]]) * w
 
     n_neighbors = min(20, len(X))
     knn = NearestNeighbors(n_neighbors=n_neighbors, metric="euclidean")

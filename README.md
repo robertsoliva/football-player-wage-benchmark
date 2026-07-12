@@ -119,16 +119,19 @@ pytest tests/ -v
 
 ### How peer groups are built
 
-For a given player, peers are drawn from the salary database using a **weighted KNN** on four normalised features:
+For a given player, peers are drawn from the salary database using a **weighted KNN** on five normalised features:
 
 | Feature | Weight | Encoding | Rationale |
 |---------|--------|----------|-----------|
-| Market value | **0.30** | log-scaled then MinMax | Captures ability level; log-scale compresses the €10 k – €200 M range |
-| League | **0.30** | per-league median wage, normalised | Premier League wages are ~3× Ligue 1 — treating them as identical "Tier 1" discards real signal |
-| Age | **0.30** | MinMax | Career-stage proxy; more experienced players command a premium |
+| Age | **0.40** | MinMax | Career-stage proxy; the strongest predictor within a position group |
+| Market value | **0.20** | log-scaled then MinMax | Captures ability level; log-scale compresses the €10 k – €200 M range |
+| Club | **0.20** | per-club median wage, normalised | PSG median (€6.9 M) is 7.6× Ligue 1 median — a Ligue 1 label alone completely misses this |
+| League | **0.10** | per-league median wage, normalised | Guards against mixing players from structurally different leagues |
 | Position | **0.10** | per-position median wage, normalised | Soft penalty for cross-position mixing (ATT vs. DEF) |
 
-**Goalkeepers are hard-filtered** — their labour market is structurally different and comparing GKs to field players would distort results. For field players (DEF / MID / ATT), position is a soft KNN feature rather than a hard filter, so a deep-lying midfielder and a centre-back can appear in each other's peer set with an appropriate distance penalty.
+**Goalkeepers are hard-filtered** — their labour market is structurally different and comparing GKs to field players would distort results. For field players (DEF / MID / ATT), position is a soft KNN feature so a deep-lying midfielder and a centre-back can appear in each other's peer set with an appropriate distance penalty.
+
+**Club name resolution**: Capology and SoccerSolver use different club names (e.g. "PSG" vs. "Paris Saint-Germain"). A curated mapping handles known abbreviations/diacritics; for the remaining clubs `partial_ratio` fuzzy matching is used (threshold 85). Clubs with no confident match fall back to their league's median wage — a graceful degradation rather than a hard failure.
 
 All features are scaled to [0, 1] using MinMaxScaler fitted on the peer pool. KNN uses L2 distance on the weighted feature matrix; up to 20 nearest neighbours are selected.
 
@@ -137,7 +140,7 @@ All features are scaled to [0, 1] using MinMaxScaler fitted on the peer pool. KN
 Weights are tuned empirically, not set by hand. The approach:
 
 1. **Holdout split** — 20 % of Capology players (stratified by position group, seed 42) held out as a test set; the remaining 80 % form the salary pool.
-2. **Grid search** — all weight 4-tuples `(w_market_value, w_league, w_age, w_position)` that sum to 1.0 in steps of 0.1 (84 combinations) are evaluated.
+2. **Grid search** — all weight 5-tuples `(w_mv, w_league, w_age, w_position, w_club)` that sum to 1.0 in steps of 0.1 (126 combinations) are evaluated.
 3. **Metrics** per combination:
    - *Coverage*: % of holdout players whose actual wage falls inside the predicted [P25, P75].
    - *Band width*: average (P75 − P25) as a share of median peer wage.
@@ -145,13 +148,16 @@ Weights are tuned empirically, not set by hand. The approach:
 
 Results on 474 holdout players:
 
-| Model | Weights (mv / league / age / pos) | Coverage | Band width |
-|-------|-----------------------------------|----------|------------|
-| Original manual | 0.40 / 0.35 / 0.25 / — | 48.7 % | 76.4 % |
-| 3-feature tuned | 0.30 / — / 0.50 / — | 51.9 % | 78.7 % |
-| **4-feature tuned** | **0.30 / 0.30 / 0.30 / 0.10** | **54.0 %** | **83.8 %** |
+| Model | Weights (mv / league / age / pos / club) | Coverage | Band width |
+|-------|------------------------------------------|----------|------------|
+| Original manual | 0.40 / 0.35 / 0.25 / — / — | 48.7 % | 76.4 % |
+| 3-feature tuned | 0.30 / — / 0.50 / — / — | 51.9 % | 78.7 % |
+| 4-feature tuned | 0.30 / 0.30 / 0.30 / 0.10 / — | 54.0 % | 83.8 % |
+| **5-feature tuned** | **0.20 / 0.10 / 0.40 / 0.10 / 0.20** | **53.8 %** | **78.1 %** |
 
-The main gain comes from replacing the binary tier flag with a continuous league-wage encoding. Premier League median annual wages (€2.7 M) are roughly 3× Ligue 1 (€0.9 M) — once the model can see that difference, it stops grouping those players as peers.
+The 5-feature model trades a marginal 0.2 pp of coverage for significantly narrower prediction bands (78.1 % vs. 83.8 %) and, crucially, fixes structurally wrong peer groups. Without the club feature, Achraf Hakimi (PSG) was benchmarked against average Ligue 1 defenders and received a predicted range of ~€3 M — off by 4.5×. With club weight 0.20, his peers are Bayern Munich, Barcelona, Atlético Madrid and PSG players, and his predicted range is €6–12.7 M (actual: €13.6 M, just above P75 — correct for one of the world's highest-paid fullbacks).
+
+The aggregate holdout metric does not fully reward the club feature because there are only ~5 mega-club players in the 474-player test set. The gain is real but concentrated.
 
 The full grid and validation script are in `scripts/tune_weights.py`.
 
