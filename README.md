@@ -180,7 +180,7 @@ XGBoost produces tighter intervals but misses the actual wage more often — a w
 | Output | Definition |
 |--------|-----------|
 | **P25 / Median / P75** | 25th, 50th, 75th percentile of peer annual wages (€/year) |
-| **Confidence** | High ≥ 15 peers · Medium ≥ 5 · Low < 5 |
+| **Precision indicator** | Peer count + range width as ±X% of the median (e.g. "20 peers · ±38%") — smaller % means tighter, more confident prediction |
 | **Percentile rank** | Where the player's known wage sits in the peer distribution (shown if wage is provided) |
 | **Peer table** | The matched players with club, league, age, and wage |
 
@@ -195,7 +195,7 @@ Built with Streamlit. Select any of the 19 000+ players in SoccerSolver's datase
 - Optional field to enter the player's known annual wage — enables percentile ranking.
 
 **Main panel**
-- Confidence badge (High / Medium / Low) with peer count.
+- Precision indicator: peer count and range width as ±X% of the median peer wage.
 - Three metric cards: P25 / Median / P75 annual wage.
 - If a known wage is entered: percentile statement (e.g. "at the 72nd percentile — above the median").
 - Histogram of peer wages with P25/Median/P75 reference lines and (optionally) the player's current wage.
