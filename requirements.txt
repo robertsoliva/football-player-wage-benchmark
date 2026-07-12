@@ -1,4 +1,5 @@
 pandas>=2.2
+pyarrow>=7.0,<18.0
 duckdb>=1.1
 streamlit>=1.40
 scikit-learn>=1.5

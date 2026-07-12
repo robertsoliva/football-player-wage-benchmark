@@ -24,6 +24,7 @@ CREATE TABLE IF NOT EXISTS salary_data (
     league_tier        INTEGER,
     wage_eur_weekly    DOUBLE,
     ea_value_eur       DOUBLE,
+    market_value_eur   DOUBLE,
     source             TEXT,
     run_key            TEXT
 );
@@ -72,7 +73,7 @@ def load(df: pd.DataFrame, source_label: str) -> None:
     cols = [
         "player_name", "short_name", "primary_position", "position_group",
         "age", "club_name", "league_name", "league_tier",
-        "wage_eur_weekly", "ea_value_eur", "source", "run_key",
+        "wage_eur_weekly", "ea_value_eur", "market_value_eur", "source", "run_key",
     ]
     staging = df[cols]
     con.register("_staging", staging)

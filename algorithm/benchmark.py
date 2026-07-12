@@ -20,7 +20,7 @@ from pathlib import Path
 import duckdb
 import numpy as np
 import pandas as pd
-from rapidfuzz import process as fuzz_process, fuzz
+from rapidfuzz import process as fuzz_process, fuzz, distance as fuzz_distance
 from sklearn.neighbors import NearestNeighbors
 from sklearn.preprocessing import MinMaxScaler
 
@@ -70,7 +70,7 @@ def _load_ss_data() -> pd.DataFrame:
     df = pd.read_csv(SS_DATA)
     df["birth_date"] = pd.to_datetime(df["birth_date"], utc=True, errors="coerce")
     age_days = (pd.Timestamp.now(tz="UTC") - df["birth_date"]).dt.days
-    df["age"] = (age_days / 365.25).fillna(25).astype(int)  # fallback to 25 for missing
+    df["age"] = (age_days / 365.25).fillna(25).astype(int)
     df["league_tier"] = df["competition_id"].map(LEAGUE_TIER).fillna(2).astype(int)
     df["market_value"] = pd.to_numeric(df["market_value"], errors="coerce").fillna(0)
     return df
@@ -84,49 +84,67 @@ def get_all_players() -> pd.DataFrame:
 
 # ── Market-value enrichment via fuzzy match ───────────────────────────────────
 
+def load_enriched_salary_db() -> pd.DataFrame:
+    """Load salary data (market_value_eur pre-computed by the pipeline)."""
+    return _load_salary_db()
+
+
 def _enrich_with_market_values(salary_df: pd.DataFrame, ss_df: pd.DataFrame) -> pd.DataFrame:
     """
     For each player in salary_df, try to find a matching player in ss_df by
-    fuzzy name match within the same league tier. Populates 'market_value_eur'.
+    fuzzy name match. Populates 'market_value_eur'.
 
-    Players with no match get market_value_eur = 0 (treated as unknown/low).
+    Uses vectorized cdist calls per tier (all-in-C, no per-row GIL churn)
+    which is safe to call from non-main threads (e.g. Streamlit's runner).
     """
+    import numpy as np
+
     salary_df = salary_df.copy()
+    market_values = np.zeros(len(salary_df), dtype=float)
 
-    # Build a lookup: league_tier → {player_name: market_value}
-    ss_by_tier: dict[int, dict[str, float]] = {}
-    for tier, grp in ss_df.groupby("league_tier"):
-        ss_by_tier[int(tier)] = dict(zip(grp["player_name"], grp["market_value"]))
+    # Process each tier separately so the matrix stays small
+    for tier in salary_df["league_tier"].unique():
+        sal_mask = salary_df["league_tier"] == tier
+        ss_mask = ss_df["league_tier"] == tier
 
-    # Also build a cross-tier fallback
-    ss_all = dict(zip(ss_df["player_name"], ss_df["market_value"]))
+        sal_names = salary_df.loc[sal_mask, "player_name"].tolist()
+        ss_sub = ss_df[ss_mask]
+        ss_names = ss_sub["player_name"].tolist()
+        ss_vals = ss_sub["market_value"].to_numpy()
 
-    def _lookup(row: pd.Series) -> float:
-        candidates = ss_by_tier.get(int(row["league_tier"]), {})
-        name = row["player_name"]
+        if not sal_names or not ss_names:
+            continue
 
-        if not candidates:
-            candidates = ss_all
-
-        names_list = list(candidates.keys())
-        match = fuzz_process.extractOne(
-            name, names_list, scorer=fuzz.token_sort_ratio, score_cutoff=FUZZY_THRESHOLD
+        scores = fuzz_process.cdist(
+            sal_names, ss_names,
+            scorer=fuzz.token_sort_ratio,
+            workers=1,   # single-threaded: no sub-thread spawning inside Streamlit
+            score_cutoff=0,
         )
-        if match:
-            return candidates[match[0]]
+        best_idx = scores.argmax(axis=1)
+        best_score = scores[np.arange(len(sal_names)), best_idx]
+        matched = best_score >= FUZZY_THRESHOLD
+        tier_vals = np.where(matched, ss_vals[best_idx], 0.0)
+        market_values[np.where(sal_mask)[0]] = tier_vals
 
-        # Cross-tier fallback
-        if candidates is not ss_all:
-            match = fuzz_process.extractOne(
-                name, list(ss_all.keys()), scorer=fuzz.token_sort_ratio,
-                score_cutoff=FUZZY_THRESHOLD
-            )
-            if match:
-                return ss_all[match[0]]
+    # Cross-tier fallback for players still unmatched (market_value == 0)
+    unmatched_mask = market_values == 0.0
+    if unmatched_mask.any():
+        all_ss_names = ss_df["player_name"].tolist()
+        all_ss_vals = ss_df["market_value"].to_numpy()
+        unmatched_sal_names = salary_df.loc[unmatched_mask, "player_name"].tolist()
+        fb_scores = fuzz_process.cdist(
+            unmatched_sal_names, all_ss_names,
+            scorer=fuzz.token_sort_ratio,
+            workers=1,
+            score_cutoff=0,
+        )
+        fb_idx = fb_scores.argmax(axis=1)
+        fb_best = fb_scores[np.arange(len(unmatched_sal_names)), fb_idx]
+        fb_vals = np.where(fb_best >= FUZZY_THRESHOLD, all_ss_vals[fb_idx], 0.0)
+        market_values[unmatched_mask] = fb_vals
 
-        return 0.0
-
-    salary_df["market_value_eur"] = salary_df.apply(_lookup, axis=1)
+    salary_df["market_value_eur"] = market_values
 
     matched = (salary_df["market_value_eur"] > 0).sum()
     logger.info(
@@ -139,13 +157,14 @@ def _enrich_with_market_values(salary_df: pd.DataFrame, ss_df: pd.DataFrame) -> 
 # ── Main benchmark function ───────────────────────────────────────────────────
 
 def benchmark_player(
-    player_name: str, current_wage_eur_year: float | None = None
+    player_name: str,
+    current_wage_eur_year: float | None = None,
 ) -> BenchmarkResult:
     """
     Compute the salary benchmark for a player in SoccerSolver's dataset.
 
     Args:
-        player_name:          Exact name as it appears in data.csv.
+        player_name:           Exact name as it appears in data.csv.
         current_wage_eur_year: Optional actual wage (€/year) to compute percentile.
     """
     ss_df = _load_ss_data()
@@ -155,10 +174,8 @@ def benchmark_player(
     player = player_row.iloc[0]
 
     position_group = _map_position(player["main_position"])
-    salary_df = _load_salary_db()
 
-    # Enrich salary records with market values from SoccerSolver
-    salary_df = _enrich_with_market_values(salary_df, ss_df)
+    salary_df = load_enriched_salary_db()
 
     # Filter to the same position group
     peers_pool = salary_df[salary_df["position_group"] == position_group].copy()

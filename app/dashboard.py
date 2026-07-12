@@ -22,6 +22,7 @@ st.set_page_config(
 st.title("⚽ Football Player Wage Benchmark")
 st.caption("Is this player paid above or below market rate?")
 
+
 # ── Sidebar: player selector ──────────────────────────────────────────────────
 with st.sidebar:
     st.header("Select a player")
@@ -52,7 +53,7 @@ with st.sidebar:
     )
     current_wage = current_wage_input if current_wage_input > 0 else None
 
-    run_btn = st.button("Run benchmark", type="primary", use_container_width=True)
+    run_btn = st.button("Run benchmark", type="primary", width="stretch")
 
 # ── Main area ─────────────────────────────────────────────────────────────────
 if not run_btn:
@@ -149,7 +150,7 @@ if current_wage:
 else:
     chart = hist + rules
 
-st.altair_chart(chart, use_container_width=True)
+st.altair_chart(chart, width="stretch")
 
 # ── Peer table ────────────────────────────────────────────────────────────────
 st.subheader(f"Peer players used ({result.peer_count})")
@@ -167,5 +168,5 @@ st.dataframe(
     display[["Player", "Club", "League", "Age", "Wage (€/week)", "Wage (€/year)"]]
     .sort_values("Wage (€/year)", ascending=False)
     .reset_index(drop=True),
-    use_container_width=True,
+    width="stretch",
 )
