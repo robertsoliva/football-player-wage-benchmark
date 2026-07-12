@@ -63,7 +63,7 @@ Then open **http://localhost:8501**, pick a player, and click **Run benchmark**.
 
 Capology publishes **reported gross annual wages** for the five major European leagues (Premier League, La Liga, Bundesliga, Ligue 1, Serie A). The data is embedded directly in the page HTML as a JavaScript array — no API key, no paywall — so it can be scraped reliably with a standard HTTP client. These are the closest thing to real contract figures available in public sources.
 
-EA FC 25 (Kaggle) is kept as an automatic fallback: if the Capology scrape fails for any reason (network error, site restructure), the pipeline transparently switches to the EA FC dataset without user intervention.
+EA FC 25 (Kaggle) is kept as an automatic fallback: if the Capology scrape fails for any reason (network error, site restructure), the pipeline transparently switches to the EA FC dataset without user intervention. The EA FC 25 file is downloaded once via the `kagglehub` library and cached locally — subsequent runs read the cached file, so the fallback does not depend on Kaggle being reachable either. If both sources fail, the pipeline raises an `IngestionError` with a clear message (including a reminder to configure `~/.kaggle/kaggle.json` if credentials are missing).
 
 ### How Capology is scraped
 
@@ -86,10 +86,11 @@ Capology does not publish market values. After scraping, the pipeline fuzzy-matc
 **Idempotency** — the pipeline checks a `pipeline_runs` metadata table before inserting. Re-running on the same calendar day is a no-op. Re-running on a new day picks up fresh Capology data automatically. The idempotency key is `{source}:{YYYY-MM-DD}`.
 
 **Validation** applied before any data is written:
-- `wage_eur_weekly` must be a positive number — zero-wage rows are dropped and logged.
-- `age` must be between 15 and 45.
-- `position` must map to a canonical group (GK / DEF / MID / ATT). Capology's broad codes (F/M/D/GK) and standard FIFA position abbreviations (ST, CAM, CB, etc.) are both supported.
-- Duplicate records for the same player + club are deduplicated (first occurrence kept).
+- `wage_eur_weekly` must be a positive number — rows with null or zero wages are **dropped and logged**; the rest of the dataset is unaffected.
+- `age` must be between 15 and 45 — out-of-range rows are **dropped**.
+- `position` must map to a canonical group (GK / DEF / MID / ATT). Capology's broad codes (F/M/D/GK) and standard FIFA abbreviations (ST, CAM, CB, etc.) are both supported. Rows whose position cannot be mapped are **dropped**.
+- Duplicate records for the same player + club are **deduplicated** (first occurrence kept).
+- If a required column is missing entirely (e.g. the source changes its schema), a `ValidationError` is raised **before any data is written** to the database.
 
 **Error handling** — `ScrapingError` and `IngestionError` are raised with the HTTP status and URL so failures are immediately diagnosable. A `ValidationError` fires before writes if required columns are missing.
 
@@ -101,7 +102,16 @@ Capology does not publish market values. After scraping, the pipeline fuzzy-matc
 pytest tests/ -v
 ```
 
-28 tests covering the scraper parser, data validation, position mapping, and the KNN benchmark logic.
+28 tests across three files. A few examples of what's asserted:
+
+- A row with `wage = 0` is dropped; a row with `wage = null` is dropped; a valid row is kept.
+- A player with `age = 14` is dropped; `age = 25` is kept.
+- `"ST"` maps to `"ATT"`; `"CB"` maps to `"DEF"`; `"GK"` maps to `"GK"`.
+- When a player appears twice under the same club, only one record survives deduplication.
+- An unknown league defaults to tier 2; Premier League resolves to tier 1.
+- A missing required column (`wage_eur`) raises `ValidationError` before any write.
+- The median annual wage equals exactly 52 × the median weekly wage.
+- P25 ≤ Median ≤ P75 holds for any peer set.
 
 ---
 
