@@ -36,13 +36,16 @@ def _make_result(peer_count: int, wages: list[float]) -> BenchmarkResult:
         "wage_eur_weekly": wages,
     })
     wages_year = np.array(wages) * 52
+    median_w = float(np.median(wages_year))
+    p25_w = float(np.percentile(wages_year, 25))
+    p75_w = float(np.percentile(wages_year, 75))
     return BenchmarkResult(
         player_name="Test Player",
         position_group="ATT",
-        median_wage_eur_year=float(np.median(wages_year)),
-        p25_wage_eur_year=float(np.percentile(wages_year, 25)),
-        p75_wage_eur_year=float(np.percentile(wages_year, 75)),
-        confidence="High" if peer_count >= 15 else ("Medium" if peer_count >= 5 else "Low"),
+        median_wage_eur_year=median_w,
+        p25_wage_eur_year=p25_w,
+        p75_wage_eur_year=p75_w,
+        range_pct=round((p75_w - p25_w) / median_w * 100, 1) if median_w > 0 else 0.0,
         peer_count=peer_count,
         peers=peers,
     )
@@ -53,19 +56,15 @@ def test_result_range_ordering():
     assert result.p25_wage_eur_year <= result.median_wage_eur_year <= result.p75_wage_eur_year
 
 
-def test_result_confidence_high():
-    result = _make_result(15, [5000] * 15)
-    assert result.confidence == "High"
+def test_result_range_pct_non_negative():
+    result = _make_result(20, [1000 * i for i in range(1, 21)])
+    assert result.range_pct >= 0
 
 
-def test_result_confidence_medium():
-    result = _make_result(10, [5000] * 10)
-    assert result.confidence == "Medium"
-
-
-def test_result_confidence_low():
-    result = _make_result(3, [5000] * 3)
-    assert result.confidence == "Low"
+def test_result_precision_tighter_for_uniform_wages():
+    uniform = _make_result(10, [5000] * 10)
+    spread = _make_result(10, [1000 * i for i in range(1, 11)])
+    assert uniform.range_pct < spread.range_pct
 
 
 def test_result_annual_wage_is_52x_weekly():
